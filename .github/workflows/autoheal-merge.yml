@@ -1,0 +1,89 @@
+name: autoheal-merge
+
+# The proposed examdojo-gtm design, with the guardrails reduced to "the review passed":
+# - every PR push gets an `autoheal-review` commit status (pending on autoheal/ branches, success
+#   elsewhere), set from main's copy of this file;
+# - when the review passes on the current head, the status turns success and auto-merge is switched
+#   on with the app's token; a failed review turns it failure.
+
+on:
+  workflow_run:
+    workflows: [Claude PR Review]
+    types: [completed]
+    branches: ['autoheal/**']
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+  checks: read
+
+jobs:
+  mark:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-slim
+    steps:
+      - name: Set autoheal-review on the new head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ "$HEAD_REF" == autoheal/* ]]; then
+            STATE=pending DESC="Waiting for the Claude review"
+          else
+            STATE=success DESC="Not an autoheal PR"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state="$STATE" -f context=autoheal-review -f description="$DESC" --jq '"\(.state) \(.context) on \(.url)"'
+
+  merge:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-slim
+    concurrency:
+      group: autoheal-merge
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: ${{ vars.AUTOHEAL_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOHEAL_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Approve reviewed heads and switch on auto-merge
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -o pipefail
+          echo "gh $(gh --version | head -1); jq $(jq --version)"
+          PRS=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("autoheal/")) | .number')
+          for N in $PRS; do
+            HEAD=$(gh pr view "$N" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+            REVIEW=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD/check-runs?check_name=review-with-tracking" \
+              --jq '[.check_runs[] | select(.conclusion != "skipped")] | sort_by(.started_at) | last
+                    | if . == null then "pending" elif .status != "completed" then "pending" else .conclusion end')
+            echo "#$N head=${HEAD:0:7} review=$REVIEW"
+            case "$REVIEW" in
+              success)
+                gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD" \
+                  -f state=success -f context=autoheal-review -f description="The Claude review passed" --silent
+                GH_TOKEN="$APP_TOKEN" gh pr merge "$N" --repo "$GITHUB_REPOSITORY" --auto --squash --match-head-commit "$HEAD" \
+                  && echo "#$N: gh pr merge --auto succeeded" || echo "::warning::#$N: gh pr merge --auto failed"
+                gh pr view "$N" --repo "$GITHUB_REPOSITORY" --json state,mergeStateStatus,autoMergeRequest \
+                  --jq '"state=\(.state) merge=\(.mergeStateStatus) auto=\(.autoMergeRequest != null)"'
+                ;;
+              pending) echo "#$N: review still running" ;;
+              *)
+                gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD" \
+                  -f state=failure -f context=autoheal-review -f description="The Claude review failed" --silent
+                ;;
+            esac
+          done

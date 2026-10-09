@@ -1,0 +1,23 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened, labeled]
+
+jobs:
+  review-with-tracking:
+    # Like the real review: a `labeled` event produces a skipped run on the same head.
+    if: github.event.action != 'labeled'
+    runs-on: ubuntu-slim
+    steps:
+      - name: Simulated review
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          SECS=$(grep -oE '\[review=[0-9]+\]' <<< "$TITLE" | grep -oE '[0-9]+' || true)
+          echo "Sleeping ${SECS:-30}s"
+          sleep "${SECS:-30}"
+          if grep -q '\[fail-review\]' <<< "$TITLE"; then
+            echo "::error::Simulated review failure"
+            exit 1
+          fi

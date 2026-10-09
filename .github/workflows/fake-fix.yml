@@ -1,0 +1,56 @@
+name: fake-fix
+
+# Stands in for pipeline-autoheal's fix job: pushes a commit as the GitHub App, and opens the PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to push to (autoheal/... for an autoheal PR)
+        required: true
+      title:
+        description: PR title (only used when opening)
+        default: 'fix: sandbox change'
+      mode:
+        description: open = new branch and PR, push = one more commit on an existing branch
+        type: choice
+        options: [open, push]
+        default: open
+
+permissions:
+  contents: read
+
+jobs:
+  fix:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: ${{ vars.AUTOHEAL_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOHEAL_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ steps.app.outputs.token }}
+          ref: ${{ inputs.mode == 'push' && inputs.branch || 'main' }}
+
+      - name: Commit, push and maybe open the PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BRANCH: ${{ inputs.branch }}
+          TITLE: ${{ inputs.title }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          git config user.name "autoheal-sandbox[bot]"
+          git config user.email "autoheal-sandbox[bot]@users.noreply.github.com"
+          [ "$MODE" = open ] && git switch -c "$BRANCH"
+          date -u +%FT%T.%NZ > "changes/$(date +%s%N).txt"
+          git add changes
+          git commit -m "fix: sandbox change ($MODE)"
+          git push origin "HEAD:$BRANCH"
+          if [ "$MODE" = open ]; then
+            gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "Sandbox PR opened by the app."
+          fi
